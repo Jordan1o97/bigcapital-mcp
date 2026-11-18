@@ -123,7 +123,12 @@ def build():
         keep_alive=True,
     )
 
-    server = create_proxy(transport, name="Bigcapital (Halifax Automation)", auth=auth)
+    # The generated child server uses an older MCP SDK that only speaks the
+    # legacy (handshake) protocol era, so pin the backend to it rather than
+    # mirroring a modern front-end client.
+    server = create_proxy(
+        transport, mode="legacy", name="Bigcapital (Halifax Automation)", auth=auth
+    )
     server.add_middleware(ToolGate(allowed_tools))
     return server
 
