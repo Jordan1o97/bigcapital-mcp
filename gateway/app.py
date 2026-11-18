@@ -1,28 +1,31 @@
 """HTTP gateway for the Bigcapital MCP server.
 
 Runs the generated stdio server (server/build/index.js) as a child process and
-exposes it over streamable HTTP behind Google OAuth. Three independent gates:
+exposes it over streamable HTTP. Two independent gates:
 
-1. Google OAuth (FastMCP GoogleProvider): no valid token -> 401.
-2. Email allowlist: the token's verified Google email must be in
-   BIGCAPITAL_MCP_ALLOWED_EMAILS, checked on every MCP request.
-3. Tool allowlist: the child server only loads tools named in
+1. Bearer token: every request needs `Authorization: Bearer <token>`. The
+   server only stores SHA-256 hashes of the accepted tokens, one per client,
+   in BIGCAPITAL_MCP_TOKEN_SHA256S as `name:hexdigest,name:hexdigest`.
+   Missing or unknown tokens get 401.
+2. Tool allowlist: the child server only loads tools named in
    BIGCAPITAL_TOOL_ALLOWLIST_FILE, and this gateway refuses calls to any
    other name as well.
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import logging
 import os
 import pathlib
+import re
 import sys
 
 from fastmcp.client.transports import StdioTransport
-from fastmcp.exceptions import AuthorizationError, ToolError
+from fastmcp.exceptions import ToolError
 from fastmcp.server import create_proxy
-from fastmcp.server.auth.providers.google import GoogleProvider
-from fastmcp.server.dependencies import get_access_token
+from fastmcp.server.auth import AccessToken, TokenVerifier
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 
 log = logging.getLogger("bigcapital-mcp-gateway")
@@ -53,34 +56,47 @@ def load_allowlist(path: str) -> frozenset[str]:
     return frozenset(names)
 
 
-def parse_emails(raw: str) -> frozenset[str]:
-    emails = frozenset(e.strip().lower() for e in raw.split(",") if e.strip())
-    if not emails:
-        sys.exit("BIGCAPITAL_MCP_ALLOWED_EMAILS must list at least one email")
-    return emails
+def parse_token_hashes(raw: str) -> dict[str, str]:
+    """Parses `name:sha256hex,...` into {name: digest}."""
+    hashes: dict[str, str] = {}
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        name, sep, digest = entry.partition(":")
+        digest = digest.strip().lower()
+        if not sep or not name.strip() or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            sys.exit("BIGCAPITAL_MCP_TOKEN_SHA256S entries must look like name:<64 hex chars>")
+        hashes[name.strip()] = digest
+    if not hashes:
+        sys.exit("BIGCAPITAL_MCP_TOKEN_SHA256S must contain at least one token hash")
+    return hashes
 
 
-class AccessGate(Middleware):
-    """Rejects callers whose Google email is not allowed, and unlisted tools."""
+class HashedBearerVerifier(TokenVerifier):
+    """Accepts a bearer token whose SHA-256 matches one of the configured hashes."""
 
-    def __init__(self, allowed_emails: frozenset[str], allowed_tools: frozenset[str]):
-        self.allowed_emails = allowed_emails
+    def __init__(self, hashes: dict[str, str]):
+        super().__init__()
+        self._hashes = hashes
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        digest = hashlib.sha256(token.encode()).hexdigest()
+        matched = None
+        for name, expected in self._hashes.items():
+            if hmac.compare_digest(digest, expected):
+                matched = name
+        if matched is None:
+            log.warning("Rejected MCP request with an unknown bearer token")
+            return None
+        return AccessToken(token=token, client_id=matched, scopes=[], expires_at=None)
+
+
+class ToolGate(Middleware):
+    """Refuses calls to tools that are not on the allowlist."""
+
+    def __init__(self, allowed_tools: frozenset[str]):
         self.allowed_tools = allowed_tools
-
-    def _check_caller(self) -> None:
-        token = get_access_token()
-        claims = getattr(token, "claims", None) or {}
-        email = str(claims.get("email") or "").lower()
-        verified = claims.get("email_verified")
-        if verified in (False, "false"):
-            email = ""
-        if not email or email not in self.allowed_emails:
-            log.warning("Rejected MCP request from non-allowlisted caller")
-            raise AuthorizationError("This Google account is not allowed to use this server.")
-
-    async def on_request(self, context: MiddlewareContext, call_next):
-        self._check_caller()
-        return await call_next(context)
 
     async def on_call_tool(self, context: MiddlewareContext, call_next):
         name = getattr(context.message, "name", None)
@@ -91,19 +107,10 @@ class AccessGate(Middleware):
 
 def build():
     logging.basicConfig(level=logging.INFO)
-    allowlist_path = _require("BIGCAPITAL_TOOL_ALLOWLIST_FILE")
-    allowed_tools = load_allowlist(allowlist_path)
-    allowed_emails = parse_emails(_require("BIGCAPITAL_MCP_ALLOWED_EMAILS"))
+    allowed_tools = load_allowlist(_require("BIGCAPITAL_TOOL_ALLOWLIST_FILE"))
+    auth = HashedBearerVerifier(parse_token_hashes(_require("BIGCAPITAL_MCP_TOKEN_SHA256S")))
     _require("API_BASE_URL")
     _require("BIGCAPITAL_BEARER_TOKEN")
-
-    auth = GoogleProvider(
-        client_id=_require("BIGCAPITAL_MCP_OAUTH_CLIENT_ID"),
-        client_secret=_require("BIGCAPITAL_MCP_OAUTH_CLIENT_SECRET"),
-        base_url=_require("BIGCAPITAL_MCP_BASE_URL"),
-        jwt_signing_key=_require("BIGCAPITAL_MCP_JWT_SIGNING_KEY"),
-        required_scopes=["openid", "https://www.googleapis.com/auth/userinfo.email"],
-    )
 
     child_env = {k: os.environ[k] for k in CHILD_ENV_KEYS if os.environ.get(k)}
     child_env["PATH"] = os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")
@@ -117,7 +124,7 @@ def build():
     )
 
     server = create_proxy(transport, name="Bigcapital (Halifax Automation)", auth=auth)
-    server.add_middleware(AccessGate(allowed_emails, allowed_tools))
+    server.add_middleware(ToolGate(allowed_tools))
     return server
 
 
