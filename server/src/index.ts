@@ -6,6 +6,7 @@
 
 // Load environment variables from .env file
 import dotenv from 'dotenv';
+import { readFileSync } from 'node:fs';
 dotenv.config();
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -3616,6 +3617,29 @@ for (const def of toolDefinitionMap.values()) {
   if (schema && Array.isArray(schema.required)) {
     schema.required = schema.required.filter((n: string) => !INJECTED_HEADERS.has(n));
   }
+}
+
+// HFX: optional tool allowlist. When BIGCAPITAL_TOOL_ALLOWLIST_FILE is set, every
+// tool not named in that file (one name per line, # comments allowed) is removed
+// before the server starts, so it can be neither listed nor called. Unknown names
+// abort startup so a typo can never silently widen or empty the tool set.
+const allowlistFile = process.env.BIGCAPITAL_TOOL_ALLOWLIST_FILE;
+if (allowlistFile) {
+  const allowed = new Set(
+    readFileSync(allowlistFile, 'utf8')
+      .split(/\r?\n/)
+      .map(l => l.replace(/#.*/, '').trim())
+      .filter(Boolean),
+  );
+  const unknown = [...allowed].filter(n => !toolDefinitionMap.has(n));
+  if (unknown.length) {
+    console.error(`Allowlist names not found in tool map: ${unknown.join(', ')}`);
+    process.exit(1);
+  }
+  for (const name of [...toolDefinitionMap.keys()]) {
+    if (!allowed.has(name)) toolDefinitionMap.delete(name);
+  }
+  console.error(`Tool allowlist applied: ${toolDefinitionMap.size} tools exposed.`);
 }
 
 /**
